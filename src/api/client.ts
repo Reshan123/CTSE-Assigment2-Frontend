@@ -3,8 +3,22 @@ import type { RunResult } from "../types";
 
 const http = axios.create({ baseURL: "/api" });
 
-export async function runPipeline(quizJson: object): Promise<RunResult> {
-  const { data } = await http.post<RunResult>("/run", { quiz_json: quizJson });
+export interface RunStatus {
+  status: "running" | "done" | "error";
+  logs: string[];
+  result: RunResult | null;
+  error: string | null;
+}
+
+/** Start a pipeline run. Returns run_id immediately — job runs in background. */
+export async function startRun(quizJson: object): Promise<string> {
+  const { data } = await http.post<{ run_id: string }>("/run", { quiz_json: quizJson });
+  return data.run_id;
+}
+
+/** Poll the status of a running or completed job. */
+export async function pollRun(runId: string): Promise<RunStatus> {
+  const { data } = await http.get<RunStatus>(`/run/${runId}`);
   return data;
 }
 

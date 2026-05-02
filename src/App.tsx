@@ -1,20 +1,26 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Header from "./components/Header";
 import QuizInput from "./components/QuizInput";
 import PipelineStatus from "./components/PipelineStatus";
 import ResultsPanel from "./components/ResultsPanel";
 import LogsPanel from "./components/LogsPanel";
 import RunHistoryDrawer from "./components/RunHistoryDrawer";
-import { runPipeline, healthCheck } from "./api/client";
+import { startRun, pollRun, healthCheck } from "./api/client";
 import { useRunHistory } from "./hooks/useRunHistory";
 import type { RunResult, AgentId, AgentStatus } from "./types";
 import { AGENTS } from "./types";
 
 type AppStatus = "idle" | "running" | "done" | "error";
 
-const SESSION_KEY = "edumas_pending_run";
-// Estimated ms at which each agent hands off to the next
-const AGENT_TIMING_MS = [35_000, 65_000, 80_000, 110_000];
+const SESSION_KEY = "edumas_active_run";
+const POLL_INTERVAL_MS = 2_000;
+
+const AGENT_LOG_MARKERS: [RegExp, AgentId][] = [
+  [/AssessmentAgent/,   "assessment"],
+  [/GapAnalystAgent/,   "gap_analyst"],
+  [/QuestionGenerator/, "question_generator"],
+  [/StudyPlannerAgent/, "study_planner"],
+];
 
 const allPending = (): Record<AgentId, AgentStatus> =>
   Object.fromEntries(AGENTS.map((a) => [a.id, "pending"])) as Record<AgentId, AgentStatus>;
@@ -22,111 +28,134 @@ const allPending = (): Record<AgentId, AgentStatus> =>
 const allDone = (): Record<AgentId, AgentStatus> =>
   Object.fromEntries(AGENTS.map((a) => [a.id, "done"])) as Record<AgentId, AgentStatus>;
 
-/** Guess which agents are done/running based on elapsed ms since pipeline started. */
-function estimateStatuses(elapsedMs: number): Record<AgentId, AgentStatus> {
+/** Infer agent progress from real log lines emitted so far. */
+function agentStatusesFromLogs(logs: string[]): Record<AgentId, AgentStatus> {
+  const seen = new Set<AgentId>();
+  for (const log of logs) {
+    for (const [re, id] of AGENT_LOG_MARKERS) {
+      if (re.test(log)) seen.add(id);
+    }
+  }
   const s = allPending();
   AGENTS.forEach((agent, idx) => {
-    const startsAt = idx === 0 ? 0 : AGENT_TIMING_MS[idx - 1];
-    const endsAt = AGENT_TIMING_MS[idx] ?? Infinity;
-    if (elapsedMs > endsAt) {
-      s[agent.id] = "done";
-    } else if (elapsedMs >= startsAt) {
-      s[agent.id] = "running";
-    }
+    if (!seen.has(agent.id)) return;
+    const next = AGENTS[idx + 1];
+    // If the next agent has already logged something, this one is done
+    s[agent.id] = next && seen.has(next.id) ? "done" : "running";
   });
   return s;
 }
 
 export default function App() {
-  const [appStatus, setAppStatus] = useState<AppStatus>("idle");
+  const [appStatus, setAppStatus]     = useState<AppStatus>("idle");
   const [agentStatuses, setAgentStatuses] = useState(allPending);
-  const [result, setResult] = useState<RunResult | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [logs, setLogs]               = useState<string[]>([]);
+  const [result, setResult]           = useState<RunResult | null>(null);
+  const [errorMsg, setErrorMsg]       = useState<string | null>(null);
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
 
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const { history, add: addToHistory, remove: removeFromHistory, clear: clearHistory } = useRunHistory();
 
   useEffect(() => {
     healthCheck().then(setServerOnline);
   }, []);
 
-  const handleRun = useCallback(async (quizJson: object, originalStartedAt?: number) => {
-    const elapsed = originalStartedAt ? Date.now() - originalStartedAt : 0;
+  function stopPolling() {
+    if (pollRef.current !== null) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }
 
+  /** Begin polling a run_id until it finishes. quizJson is needed for history. */
+  const attachPoller = useCallback((runId: string, quizJson: object) => {
+    stopPolling();
+    pollRef.current = setInterval(async () => {
+      try {
+        const status = await pollRun(runId);
+
+        // Update live logs and infer which agents are active
+        setLogs(status.logs);
+        if (status.logs.length > 0) {
+          setAgentStatuses(agentStatusesFromLogs(status.logs));
+        }
+
+        if (status.status === "done" && status.result) {
+          stopPolling();
+          setAgentStatuses(allDone());
+          setResult(status.result);
+          setAppStatus("done");
+          addToHistory(quizJson, status.result);
+          sessionStorage.removeItem(SESSION_KEY);
+        } else if (status.status === "error") {
+          stopPolling();
+          setErrorMsg(status.error ?? "Pipeline failed.");
+          setAgentStatuses((prev) => {
+            const running = Object.entries(prev).find(([, v]) => v === "running");
+            return running
+              ? ({ ...prev, [running[0]]: "error" } as Record<AgentId, AgentStatus>)
+              : prev;
+          });
+          setAppStatus("error");
+          sessionStorage.removeItem(SESSION_KEY);
+        }
+      } catch {
+        stopPolling();
+        setErrorMsg("Lost connection to server. The run may still be in progress — refresh to reconnect.");
+        setAppStatus("error");
+      }
+    }, POLL_INTERVAL_MS);
+  }, [addToHistory]);
+
+  /** Start a brand-new run. */
+  const handleRun = useCallback(async (quizJson: object) => {
+    stopPolling();
     setAppStatus("running");
     setResult(null);
     setErrorMsg(null);
-
-    // Immediately show the estimated progress so the UI looks continuous after a refresh
-    setAgentStatuses(elapsed > 0 ? estimateStatuses(elapsed) : allPending());
-
-    // Always write a fresh timestamp so a second refresh re-estimates correctly
-    sessionStorage.setItem(SESSION_KEY, JSON.stringify({ quizJson, startedAt: Date.now() }));
-
-    // Schedule remaining agent transitions, offsetting by time already elapsed
-    const timers: ReturnType<typeof setTimeout>[] = [];
-    AGENTS.forEach((agent, idx) => {
-      const scheduledAt = idx === 0 ? 200 : AGENT_TIMING_MS[idx - 1];
-      const delay = Math.max(0, scheduledAt - elapsed);
-      if (delay > 0) {
-        timers.push(
-          setTimeout(() => {
-            setAgentStatuses((prev) => ({ ...prev, [agent.id]: "running" }));
-          }, delay)
-        );
-      }
-    });
+    setLogs([]);
+    setAgentStatuses(allPending());
 
     try {
-      const res = await runPipeline(quizJson);
-      timers.forEach(clearTimeout);
-      setAgentStatuses(allDone());
-      setResult(res);
-      setAppStatus("done");
-      addToHistory(quizJson, res);
-      sessionStorage.removeItem(SESSION_KEY);
+      const runId = await startRun(quizJson);
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify({ runId, quizJson }));
+      attachPoller(runId, quizJson);
     } catch (err: unknown) {
-      timers.forEach(clearTimeout);
-      const msg =
-        err instanceof Error ? err.message : "Pipeline failed. Check the server is running.";
+      const msg = err instanceof Error ? err.message : "Could not reach server.";
       setErrorMsg(msg);
-      setAgentStatuses((prev) => {
-        const running = Object.entries(prev).find(([, v]) => v === "running");
-        return running
-          ? ({ ...prev, [running[0]]: "error" } as Record<AgentId, AgentStatus>)
-          : prev;
-      });
       setAppStatus("error");
-      sessionStorage.removeItem(SESSION_KEY);
     }
-  }, [addToHistory]);
+  }, [attachPoller]);
 
-  // On mount: silently resume any in-progress run — no banner, no prompt
+  // On mount: if there's an active run in sessionStorage, reconnect to it silently
   useEffect(() => {
     try {
       const raw = sessionStorage.getItem(SESSION_KEY);
       if (!raw) return;
-      const { quizJson, startedAt } = JSON.parse(raw);
-      if (Date.now() - startedAt < 10 * 60 * 1000) {
-        handleRun(quizJson, startedAt);
-      } else {
-        sessionStorage.removeItem(SESSION_KEY);
+      const { runId, quizJson } = JSON.parse(raw);
+      if (runId) {
+        setAppStatus("running");
+        setAgentStatuses(allPending());
+        attachPoller(runId, quizJson);
       }
     } catch {
       sessionStorage.removeItem(SESSION_KEY);
     }
+    return stopPolling;
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   function restoreRun(res: RunResult) {
+    stopPolling();
     setResult(res);
+    setLogs(res.logs);
     setAgentStatuses(allDone());
     setAppStatus("done");
     setErrorMsg(null);
   }
 
   const isRunning = appStatus === "running";
-  const logs = result?.logs ?? [];
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -146,7 +175,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Pipeline status bar */}
         {appStatus !== "idle" && (
           <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
             <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
@@ -156,7 +184,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Logs panel — full width, visible during and after run */}
         {(isRunning || logs.length > 0) && (
           <LogsPanel logs={logs} isRunning={isRunning} />
         )}
