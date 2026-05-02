@@ -1,37 +1,20 @@
-"""EduMAS FastAPI server — bridges the React frontend to the Python pipeline.
+"""EduMAS FastAPI server.
 
 Setup:
-    1. Set EDUMAS_PATH to the root of the CTSE-Assigment2 project, OR place
-       this repo next to it (default path is used automatically).
-    2. pip install -r requirements.txt
-    3. uvicorn main:app --reload
+    pip install -r requirements.txt
+    uvicorn main:app --reload
 """
 from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Resolve the backend project path
-_here = Path(__file__).resolve().parent
-_default_backend = _here.parent.parent / "CTSE-Assigment2" / ".claude" / "worktrees" / "cool-tharp-428168"
-EDUMAS_PATH = Path(os.environ.get("EDUMAS_PATH", str(_default_backend)))
-
-if not EDUMAS_PATH.is_dir():
-    raise RuntimeError(
-        f"EduMAS backend not found at {EDUMAS_PATH}. "
-        "Set the EDUMAS_PATH environment variable to the project root."
-    )
-
-sys.path.insert(0, str(EDUMAS_PATH))
-
-from main import run  # noqa: E402  (imported after sys.path update)
+from pipeline import run
 
 app = FastAPI(title="EduMAS API", version="1.0.0")
 
@@ -59,7 +42,7 @@ class RunResponse(BaseModel):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "backend": str(EDUMAS_PATH)}
+    return {"status": "ok"}
 
 
 @app.post("/api/run", response_model=RunResponse)

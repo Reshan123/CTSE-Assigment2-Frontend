@@ -11,7 +11,6 @@ React + Vite frontend for the EduMAS Multi-Agent Study Planner, with a FastAPI b
 
 - Node.js 18+
 - Python 3.11+
-- The [CTSE-Assigment2](https://github.com/your-org/CTSE-Assigment2) backend cloned as a sibling directory, **or** `EDUMAS_PATH` set to its location
 - Ollama running locally with `llama3:8b` pulled
 
 ## Quick Start
@@ -23,13 +22,6 @@ cd server
 pip install -r requirements.txt
 uvicorn main:app --reload
 # Runs on http://localhost:8000
-```
-
-If the backend is not at the default path, set the env var first:
-
-```bash
-set EDUMAS_PATH=C:\path\to\CTSE-Assigment2   # Windows
-export EDUMAS_PATH=/path/to/CTSE-Assigment2   # Mac/Linux
 ```
 
 ### 2. Start the frontend
@@ -51,14 +43,11 @@ npm run dev
 
 ```json
 {
-  "subject": "Mathematics",
-  "questions": [
-    {
-      "question": "What is the derivative of x²?",
-      "student_answer": "2x",
-      "correct_answer": "2x",
-      "score": 1
-    }
+  "student": "Alice",
+  "answers": [
+    { "topic": "Calculus", "correct": false },
+    { "topic": "Calculus", "correct": false },
+    { "topic": "Statistics", "correct": true }
   ]
 }
 ```
