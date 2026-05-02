@@ -1,5 +1,6 @@
 import type { RunResult } from "../types";
 import StudyPlan from "./StudyPlan";
+import PdfViewer from "./PdfViewer";
 
 interface Props {
   result: RunResult;
@@ -57,35 +58,8 @@ export default function ResultsPanel({ result }: Props) {
         <StudyPlan plan={result.study_plan} />
       </Section>
 
-      <Section title="Output Files">
-        <div className="space-y-2 text-xs font-mono">
-          <div className="flex items-center gap-2 bg-slate-50 rounded px-3 py-2 border border-slate-100">
-            <span className="text-slate-400">MD</span>
-            <span className="text-slate-700 truncate">{result.study_plan_path}</span>
-          </div>
-          <div className="flex items-center gap-2 bg-slate-50 rounded px-3 py-2 border border-slate-100">
-            <span className="text-slate-400">PDF</span>
-            <span className="text-slate-700 truncate">{result.study_plan_pdf_path}</span>
-          </div>
-        </div>
-        <p className="text-xs text-slate-400 mt-2">
-          Files are saved on the server running the Python pipeline.
-        </p>
-      </Section>
-
-      {result.logs.length > 0 && (
-        <details className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
-          <summary className="text-sm font-semibold text-slate-500 uppercase tracking-wider cursor-pointer">
-            Execution Logs
-          </summary>
-          <div className="mt-3 space-y-1">
-            {result.logs.map((log, i) => (
-              <p key={i} className="text-xs font-mono text-slate-500 bg-slate-50 rounded px-2 py-1">
-                {log}
-              </p>
-            ))}
-          </div>
-        </details>
+      {result.study_plan_pdf_path && (
+        <PdfViewer path={result.study_plan_pdf_path} />
       )}
     </div>
   );
