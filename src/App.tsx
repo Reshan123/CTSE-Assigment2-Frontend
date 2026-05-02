@@ -10,9 +10,10 @@ import { useRunHistory } from "./hooks/useRunHistory";
 import type { RunResult, AgentId, AgentStatus } from "./types";
 import { AGENTS } from "./types";
 
-type AppStatus = "idle" | "interrupted" | "running" | "done" | "error";
+type AppStatus = "idle" | "running" | "done" | "error";
 
 const SESSION_KEY = "edumas_pending_run";
+// Estimated ms at which each agent hands off to the next
 const AGENT_TIMING_MS = [35_000, 65_000, 80_000, 110_000];
 
 const allPending = (): Record<AgentId, AgentStatus> =>
@@ -21,6 +22,21 @@ const allPending = (): Record<AgentId, AgentStatus> =>
 const allDone = (): Record<AgentId, AgentStatus> =>
   Object.fromEntries(AGENTS.map((a) => [a.id, "done"])) as Record<AgentId, AgentStatus>;
 
+/** Guess which agents are done/running based on elapsed ms since pipeline started. */
+function estimateStatuses(elapsedMs: number): Record<AgentId, AgentStatus> {
+  const s = allPending();
+  AGENTS.forEach((agent, idx) => {
+    const startsAt = idx === 0 ? 0 : AGENT_TIMING_MS[idx - 1];
+    const endsAt = AGENT_TIMING_MS[idx] ?? Infinity;
+    if (elapsedMs > endsAt) {
+      s[agent.id] = "done";
+    } else if (elapsedMs >= startsAt) {
+      s[agent.id] = "running";
+    }
+  });
+  return s;
+}
+
 export default function App() {
   const [appStatus, setAppStatus] = useState<AppStatus>("idle");
   const [agentStatuses, setAgentStatuses] = useState(allPending);
@@ -28,7 +44,6 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [pendingQuiz, setPendingQuiz] = useState<object | null>(null);
 
   const { history, add: addToHistory, remove: removeFromHistory, clear: clearHistory } = useRunHistory();
 
@@ -36,40 +51,31 @@ export default function App() {
     healthCheck().then(setServerOnline);
   }, []);
 
-  // Restore interrupted session on mount
-  useEffect(() => {
-    try {
-      const raw = sessionStorage.getItem(SESSION_KEY);
-      if (!raw) return;
-      const { quizJson, startedAt } = JSON.parse(raw);
-      const ageMs = Date.now() - startedAt;
-      if (ageMs < 10 * 60 * 1000) {
-        setPendingQuiz(quizJson);
-        setAppStatus("interrupted");
-      } else {
-        sessionStorage.removeItem(SESSION_KEY);
-      }
-    } catch {
-      sessionStorage.removeItem(SESSION_KEY);
-    }
-  }, []);
+  const handleRun = useCallback(async (quizJson: object, originalStartedAt?: number) => {
+    const elapsed = originalStartedAt ? Date.now() - originalStartedAt : 0;
 
-  const handleRun = useCallback(async (quizJson: object) => {
     setAppStatus("running");
     setResult(null);
     setErrorMsg(null);
-    setAgentStatuses(allPending());
-    setPendingQuiz(null);
 
+    // Immediately show the estimated progress so the UI looks continuous after a refresh
+    setAgentStatuses(elapsed > 0 ? estimateStatuses(elapsed) : allPending());
+
+    // Always write a fresh timestamp so a second refresh re-estimates correctly
     sessionStorage.setItem(SESSION_KEY, JSON.stringify({ quizJson, startedAt: Date.now() }));
 
+    // Schedule remaining agent transitions, offsetting by time already elapsed
     const timers: ReturnType<typeof setTimeout>[] = [];
     AGENTS.forEach((agent, idx) => {
-      timers.push(
-        setTimeout(() => {
-          setAgentStatuses((prev) => ({ ...prev, [agent.id]: "running" }));
-        }, idx === 0 ? 200 : AGENT_TIMING_MS[idx - 1])
-      );
+      const scheduledAt = idx === 0 ? 200 : AGENT_TIMING_MS[idx - 1];
+      const delay = Math.max(0, scheduledAt - elapsed);
+      if (delay > 0) {
+        timers.push(
+          setTimeout(() => {
+            setAgentStatuses((prev) => ({ ...prev, [agent.id]: "running" }));
+          }, delay)
+        );
+      }
     });
 
     try {
@@ -88,13 +94,29 @@ export default function App() {
       setAgentStatuses((prev) => {
         const running = Object.entries(prev).find(([, v]) => v === "running");
         return running
-          ? { ...prev, [running[0]]: "error" } as Record<AgentId, AgentStatus>
+          ? ({ ...prev, [running[0]]: "error" } as Record<AgentId, AgentStatus>)
           : prev;
       });
       setAppStatus("error");
       sessionStorage.removeItem(SESSION_KEY);
     }
   }, [addToHistory]);
+
+  // On mount: silently resume any in-progress run — no banner, no prompt
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(SESSION_KEY);
+      if (!raw) return;
+      const { quizJson, startedAt } = JSON.parse(raw);
+      if (Date.now() - startedAt < 10 * 60 * 1000) {
+        handleRun(quizJson, startedAt);
+      } else {
+        sessionStorage.removeItem(SESSION_KEY);
+      }
+    } catch {
+      sessionStorage.removeItem(SESSION_KEY);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   function restoreRun(res: RunResult) {
     setResult(res);
@@ -115,7 +137,6 @@ export default function App() {
 
       <main className="flex-1 max-w-6xl mx-auto w-full px-4 py-8 flex flex-col gap-6">
 
-        {/* Server offline warning */}
         {serverOnline === false && (
           <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 text-sm text-amber-800">
             <strong>Server not detected.</strong> Start the FastAPI server:
@@ -125,32 +146,8 @@ export default function App() {
           </div>
         )}
 
-        {/* Interrupted session banner */}
-        {appStatus === "interrupted" && pendingQuiz && (
-          <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 flex items-center justify-between gap-4">
-            <div>
-              <p className="text-sm font-semibold text-blue-800">Run was interrupted by a page refresh</p>
-              <p className="text-xs text-blue-600 mt-0.5">The pipeline did not complete. Restart it?</p>
-            </div>
-            <div className="flex gap-2 flex-shrink-0">
-              <button
-                onClick={() => handleRun(pendingQuiz)}
-                className="text-xs font-semibold bg-blue-700 hover:bg-blue-800 text-white px-4 py-2 rounded-lg"
-              >
-                Restart
-              </button>
-              <button
-                onClick={() => { setAppStatus("idle"); sessionStorage.removeItem(SESSION_KEY); }}
-                className="text-xs text-blue-500 hover:text-blue-700 px-3 py-2"
-              >
-                Dismiss
-              </button>
-            </div>
-          </div>
-        )}
-
         {/* Pipeline status bar */}
-        {(appStatus === "running" || appStatus === "done" || appStatus === "error") && (
+        {appStatus !== "idle" && (
           <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
             <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
               Pipeline
@@ -159,18 +156,16 @@ export default function App() {
           </div>
         )}
 
-        {/* Logs panel — full width, shown during and after run */}
+        {/* Logs panel — full width, visible during and after run */}
         {(isRunning || logs.length > 0) && (
           <LogsPanel logs={logs} isRunning={isRunning} />
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
-          {/* Left: input */}
           <QuizInput onRun={handleRun} loading={isRunning} />
 
-          {/* Right: results */}
           <div>
-            {(appStatus === "idle" || appStatus === "interrupted") && (
+            {appStatus === "idle" && (
               <div className="bg-white rounded-xl border border-dashed border-slate-300 p-8 text-center text-slate-400">
                 <div className="text-4xl mb-3">📚</div>
                 <p className="text-sm font-medium">Results will appear here</p>
@@ -210,7 +205,7 @@ export default function App() {
         open={historyOpen}
         onClose={() => setHistoryOpen(false)}
         history={history}
-        onRestore={(res, _quiz) => restoreRun(res)}
+        onRestore={(res) => restoreRun(res)}
         onRemove={removeFromHistory}
         onClear={clearHistory}
       />
